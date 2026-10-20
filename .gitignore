@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.backup
+*.stage2-backup
+.gradle/
+build/
+local.properties
+*.jks
+*.keystore
+secrets.properties
+.env

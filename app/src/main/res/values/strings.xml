@@ -1,3 +1,10 @@
 <resources>
     <string name="app_name">Kavro Clipper Pro</string>
+    <string name="subtitle">Video se clip kaatein: start aur end time chuniye</string>
+    <string name="btn_select_video">Video chuniye</string>
+    <string name="hint_start">Start (jaise 00:05 ya 5)</string>
+    <string name="hint_end">End (jaise 00:20 ya 20)</string>
+    <string name="btn_clip">Clip banayein</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="status_idle">Pehle ek video chuniye.</string>
 </resources>

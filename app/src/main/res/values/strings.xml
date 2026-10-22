@@ -1,10 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Kavro Clipper Pro</string>
-    <string name="subtitle">Video se clip kaatein: start aur end time chuniye</string>
-    <string name="btn_select_video">Video chuniye</string>
-    <string name="hint_start">Start (jaise 00:05 ya 5)</string>
-    <string name="hint_end">End (jaise 00:20 ya 20)</string>
-    <string name="btn_clip">Clip banayein</string>
-    <string name="btn_cancel">Cancel</string>
-    <string name="status_idle">Pehle ek video chuniye.</string>
+    <string name="app_name">KavroClipperPro</string>
+    <string name="tagline">Your videos. Your moments. Your clips.</string>
+    <string name="select_video_title">Select Video</string>
+    <string name="select_video_subtitle">Choose a video to start creating clips.</string>
+    <string name="no_video_selected">No video selected</string>
+    <string name="choose_video">Choose Video</string>
+    <string name="normal_clipping">Normal Clipping</string>
+    <string name="normal_clipping_label">Fast and Simple</string>
+    <string name="normal_clipping_desc">Create sequential clips automatically from the beginning.</string>
+    <string name="number_of_clips">Number of Clips</string>
+    <string name="clip_count_hint">Example: 5</string>
+    <string name="clip_duration">Clip Duration</string>
+    <string name="clip_duration_hint">Example: 30</string>
+    <string name="seconds_unit">Seconds</string>
+    <string name="generate_clips">Generate Clips</string>
+    <string name="cancel">Cancel</string>
+    <string name="status_idle">Select a video to begin.</string>
 </resources>

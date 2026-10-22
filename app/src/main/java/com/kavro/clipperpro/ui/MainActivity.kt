@@ -9,15 +9,16 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.util.Log
 import android.view.View
-import android.widget.Button
 import android.widget.EditText
 import android.widget.MediaController
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.widget.doAfterTextChanged
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.Composition
@@ -26,22 +27,28 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.progressindicator.LinearProgressIndicator
 import com.kavro.clipperpro.R
+import com.kavro.clipperpro.core.ClipPlanner
+import com.kavro.clipperpro.core.ClipRange
+import com.kavro.clipperpro.core.PlanResult
 import java.io.File
-import java.io.FileInputStream
 import java.util.Locale
 
 @androidx.annotation.OptIn(markerClass = [UnstableApi::class])
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var btnSelect: Button
-    private lateinit var btnClip: Button
-    private lateinit var btnCancel: Button
-    private lateinit var editStart: EditText
-    private lateinit var editEnd: EditText
-    private lateinit var txtInfo: TextView
+    private lateinit var btnSelect: MaterialButton
+    private lateinit var btnGenerate: MaterialButton
+    private lateinit var btnCancel: MaterialButton
+    private lateinit var editCount: EditText
+    private lateinit var editDuration: EditText
+    private lateinit var txtFileName: TextView
+    private lateinit var txtFileInfo: TextView
+    private lateinit var txtSummary: TextView
     private lateinit var txtStatus: TextView
-    private lateinit var progress: ProgressBar
+    private lateinit var progress: LinearProgressIndicator
     private lateinit var videoView: VideoView
 
     private val handler = Handler(Looper.getMainLooper())
@@ -49,6 +56,13 @@ class MainActivity : AppCompatActivity() {
     private var durationMs: Long = 0L
     private var transformer: Transformer? = null
     private var tempOutput: File? = null
+
+    private var pendingClips: List<ClipRange> = emptyList()
+    private var currentIndex = 0
+    private val savedLocations = mutableListOf<String>()
+
+    /** Incremented on every start, cancel or destroy, so stale callbacks are ignored. */
+    private var jobId = 0
 
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) onVideoSelected(uri)
@@ -59,7 +73,9 @@ class MainActivity : AppCompatActivity() {
             val t = transformer ?: return
             val holder = ProgressHolder()
             if (t.getProgress(holder) != Transformer.PROGRESS_STATE_NOT_STARTED) {
-                progress.progress = holder.progress
+                val total = pendingClips.size.coerceAtLeast(1)
+                val overall = (currentIndex * 100 + holder.progress) / total
+                progress.setProgressCompat(overall.coerceIn(0, 100), true)
             }
             handler.postDelayed(this, 300)
         }
@@ -70,22 +86,23 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         btnSelect = findViewById(R.id.btnSelect)
-        btnClip = findViewById(R.id.btnClip)
+        btnGenerate = findViewById(R.id.btnGenerate)
         btnCancel = findViewById(R.id.btnCancel)
-        editStart = findViewById(R.id.editStart)
-        editEnd = findViewById(R.id.editEnd)
-        txtInfo = findViewById(R.id.txtInfo)
+        editCount = findViewById(R.id.editCount)
+        editDuration = findViewById(R.id.editDuration)
+        txtFileName = findViewById(R.id.txtFileName)
+        txtFileInfo = findViewById(R.id.txtFileInfo)
+        txtSummary = findViewById(R.id.txtSummary)
         txtStatus = findViewById(R.id.txtStatus)
         progress = findViewById(R.id.progress)
         videoView = findViewById(R.id.videoView)
 
         btnSelect.setOnClickListener { picker.launch("video/*") }
-        btnClip.setOnClickListener { startClip() }
-        btnCancel.setOnClickListener {
-            transformer?.cancel()
-            tempOutput?.delete()
-            finishExport("Cancel kar diya gaya.")
-        }
+        btnGenerate.setOnClickListener { startGeneration() }
+        btnCancel.setOnClickListener { cancelJob() }
+        editCount.doAfterTextChanged { updateSummary() }
+        editDuration.doAfterTextChanged { updateSummary() }
+        updateSummary()
     }
 
     private fun onVideoSelected(uri: Uri) {
@@ -96,78 +113,106 @@ class MainActivity : AppCompatActivity() {
             val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 0L
             if (hasVideo != "yes" || dur <= 0L) {
-                txtStatus.text = "Ye file valid video nahi lag rahi."
+                txtStatus.text = "This file does not look like a valid video. Please pick another one."
                 return
             }
+            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH) ?: "?"
+            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT) ?: "?"
+
             selectedUri = uri
             durationMs = dur
-            txtInfo.text = "Video length: ${formatMs(dur)}"
-            editStart.isEnabled = true
-            editEnd.isEnabled = true
-            btnClip.isEnabled = true
-            editStart.setText("0")
-            editEnd.setText(formatMs(minOf(dur, 10_000L)))
-            txtStatus.text = "Start aur end time daaliye, phir 'Clip banayein' dabaiye."
+            txtFileName.text = displayName(uri)
+            txtFileInfo.text = "${ClipPlanner.formatMs(dur)} • ${width}x${height} • ${formatSize(uri)}"
+            btnSelect.text = "Replace Video"
+
+            editCount.isEnabled = true
+            editDuration.isEnabled = true
+            btnGenerate.isEnabled = true
+            if (editCount.text.isNullOrBlank()) editCount.setText("5")
+            if (editDuration.text.isNullOrBlank()) editDuration.setText("30")
+            updateSummary()
 
             videoView.visibility = View.VISIBLE
             videoView.setMediaController(MediaController(this).also { it.setAnchorView(videoView) })
             videoView.setVideoURI(uri)
             videoView.seekTo(1)
+            txtStatus.text = "Video loaded. Choose the number of clips and their length."
         } catch (e: Exception) {
-            txtStatus.text = "Video khol nahi paye: ${e.message}"
+            Log.e(TAG, "Could not read video metadata", e)
+            txtStatus.text = "This video could not be opened. It may be damaged or unsupported."
         } finally {
             try { retriever.release() } catch (_: Exception) {}
         }
     }
 
-    /** Accepts "90", "90.5", "01:30", "1:02:03". Returns milliseconds or null if invalid. */
-    private fun parseTimeMs(text: String): Long? {
-        val parts = text.trim().split(":")
-        if (parts.isEmpty() || parts.size > 3) return null
-        var seconds = 0.0
-        for (p in parts) {
-            val v = p.trim().toDoubleOrNull() ?: return null
-            if (v < 0) return null
-            seconds = seconds * 60 + v
+    private fun displayName(uri: Uri): String {
+        return try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            } ?: "Selected video"
+        } catch (e: Exception) {
+            "Selected video"
         }
-        return (seconds * 1000).toLong()
     }
 
-    private fun formatMs(ms: Long): String {
-        val totalSec = ms / 1000
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
-        else String.format(Locale.US, "%02d:%02d", m, s)
+    private fun formatSize(uri: Uri): String {
+        val bytes: Long? = try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+        return if (bytes == null) "size unknown"
+        else String.format(Locale.US, "%.1f MB", bytes / 1_048_576.0)
     }
 
-    private fun startClip() {
+    private fun updateSummary() {
+        val count = editCount.text.toString().trim().toIntOrNull()
+        val seconds = editDuration.text.toString().trim().toIntOrNull()
+        txtSummary.text = if (count != null && seconds != null && count > 0 && seconds > 0) {
+            "$count clips • $seconds seconds each"
+        } else {
+            "Enter whole numbers to see the summary."
+        }
+    }
+
+    private fun startGeneration() {
+        if (selectedUri == null) {
+            txtStatus.text = "Select a video first."
+            return
+        }
+        val result = ClipPlanner.plan(durationMs, editCount.text.toString(), editDuration.text.toString())
+        when (result) {
+            is PlanResult.Error -> {
+                txtStatus.text = result.message
+                return
+            }
+            is PlanResult.Ok -> {
+                pendingClips = result.clips
+            }
+        }
+
+        jobId++
+        currentIndex = 0
+        savedLocations.clear()
+        setBusy(true)
+        startClip(jobId)
+    }
+
+    private fun startClip(job: Int) {
         val uri = selectedUri ?: return
-        val startMs = parseTimeMs(editStart.text.toString())
-        val endMs = parseTimeMs(editEnd.text.toString())
-        if (startMs == null || endMs == null) {
-            txtStatus.text = "Time galat hai. 00:05 ya 5 jaisa likhiye."
-            return
-        }
-        if (endMs <= startMs) {
-            txtStatus.text = "End time, start se bada hona chahiye."
-            return
-        }
-        if (endMs > durationMs) {
-            txtStatus.text = "End time video (${formatMs(durationMs)}) se bahar hai."
-            return
-        }
-
-        val out = File(cacheDir, "clip_${System.currentTimeMillis()}.mp4")
+        val clip = pendingClips[currentIndex]
+        val out = File(cacheDir, "clip_${job}_${clip.index}.mp4")
+        out.delete()
         tempOutput = out
 
         val mediaItem = MediaItem.Builder()
             .setUri(uri)
             .setClippingConfiguration(
                 MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(startMs)
-                    .setEndPositionMs(endMs)
+                    .setStartPositionMs(clip.startMs)
+                    .setEndPositionMs(clip.endMs)
                     .build()
             )
             .build()
@@ -176,7 +221,9 @@ class MainActivity : AppCompatActivity() {
         val t = Transformer.Builder(this)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    saveToGallery(out)
+                    if (job != jobId) return
+                    transformer = null
+                    saveClip(out, clip, job)
                 }
 
                 override fun onError(
@@ -184,80 +231,145 @@ class MainActivity : AppCompatActivity() {
                     exportResult: ExportResult,
                     exportException: ExportException
                 ) {
+                    if (job != jobId) return
+                    Log.e(TAG, "Export failed", exportException)
                     out.delete()
-                    finishExport("Clip fail hua: ${exportException.message}")
+                    transformer = null
+                    failJob("Clip ${clip.index} could not be created. Try a shorter duration or another video.")
                 }
             })
             .build()
         transformer = t
 
-        setBusy(true)
-        txtStatus.text = "Clip ban raha hai..."
-        progress.progress = 0
+        txtStatus.text = "Creating clip ${clip.index} of ${pendingClips.size}..."
         try {
             t.start(edited, out.absolutePath)
+            handler.removeCallbacks(progressPoller)
             handler.post(progressPoller)
         } catch (e: Exception) {
+            Log.e(TAG, "Export could not start", e)
             out.delete()
-            finishExport("Export shuru nahi hua: ${e.message}")
+            transformer = null
+            failJob("Export could not start on this device.")
         }
     }
 
-    private fun saveToGallery(src: File) {
-        txtStatus.text = "Save ho raha hai..."
+    private fun saveClip(src: File, clip: ClipRange, job: Int) {
+        txtStatus.text = "Saving clip ${clip.index} of ${pendingClips.size}..."
         Thread {
-            val name = "KavroClip_${System.currentTimeMillis()}.mp4"
-            val message = try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Video.Media.DISPLAY_NAME, name)
-                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                        put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/KavroClipperPro")
-                    }
-                    val dest = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                        ?: throw IllegalStateException("Gallery mein jagah nahi bani")
-                    contentResolver.openOutputStream(dest)!!.use { os ->
-                        FileInputStream(src).use { it.copyTo(os) }
-                    }
-                    "Clip save ho gaya: Movies/KavroClipperPro/$name"
-                } else {
-                    val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
-                    dir.mkdirs()
-                    val dest = File(dir, name)
-                    src.copyTo(dest, overwrite = true)
-                    "Clip save ho gaya: ${dest.absolutePath}"
-                }
-            } catch (e: Exception) {
-                "Save fail hua: ${e.message}"
-            } finally {
-                src.delete()
-            }
-            runOnUiThread { finishExport(message) }
+            val outcome = runCatching { saveToGallery(src, clip.index) }
+            src.delete()
+            runOnUiThread { onClipSaved(outcome, job) }
         }.start()
     }
 
-    private fun finishExport(message: String) {
+    private fun onClipSaved(outcome: Result<String>, job: Int) {
+        if (job != jobId) return
+        val error = outcome.exceptionOrNull()
+        if (error != null) {
+            Log.e(TAG, "Save failed", error)
+            failJob("Clip ${pendingClips[currentIndex].index} could not be saved. Check free storage and try again.")
+            return
+        }
+        outcome.getOrNull()?.let { savedLocations.add(it) }
+        currentIndex++
+        if (currentIndex < pendingClips.size) {
+            startClip(job)
+        } else {
+            finishJob()
+        }
+    }
+
+    /** Returns the folder label where the clip was saved. Throws on any failure. */
+    private fun saveToGallery(src: File, index: Int): String {
+        if (!src.isFile || src.length() == 0L) {
+            throw IllegalStateException("The exported file is empty.")
+        }
+        val name = "KavroClip_${System.currentTimeMillis()}_$index.mp4"
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/KavroClipperPro")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("Could not create a gallery entry.")
+            try {
+                val os = contentResolver.openOutputStream(uri)
+                    ?: throw IllegalStateException("Could not open the gallery file.")
+                os.use { out -> src.inputStream().use { it.copyTo(out) } }
+                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                contentResolver.update(uri, done, null, null)
+            } catch (e: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw e
+            }
+            "Movies/KavroClipperPro"
+        } else {
+            val base = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+            val dir = File(base, "KavroClipperPro")
+            dir.mkdirs()
+            src.copyTo(File(dir, name), overwrite = true)
+            dir.absolutePath
+        }
+    }
+
+    private fun finishJob() {
         handler.removeCallbacks(progressPoller)
         transformer = null
         setBusy(false)
-        txtStatus.text = message
+        progress.setProgressCompat(100, true)
+        val location = savedLocations.lastOrNull() ?: "app storage"
+        txtStatus.text = "Done. ${savedLocations.size} clip(s) saved to $location."
+    }
+
+    private fun failJob(message: String) {
+        handler.removeCallbacks(progressPoller)
+        try { transformer?.cancel() } catch (_: Exception) {}
+        transformer = null
+        tempOutput?.delete()
+        setBusy(false)
+        val note = if (savedLocations.isNotEmpty()) {
+            " ${savedLocations.size} clip(s) created before this were kept."
+        } else {
+            ""
+        }
+        txtStatus.text = message + note
+    }
+
+    private fun cancelJob() {
+        jobId++
+        handler.removeCallbacks(progressPoller)
+        try { transformer?.cancel() } catch (_: Exception) {}
+        transformer = null
+        tempOutput?.delete()
+        setBusy(false)
+        txtStatus.text = "Cancelled. Clips already saved are still in your gallery."
     }
 
     private fun setBusy(busy: Boolean) {
-        btnClip.isEnabled = !busy
+        btnGenerate.isEnabled = !busy
         btnSelect.isEnabled = !busy
-        editStart.isEnabled = !busy
-        editEnd.isEnabled = !busy
+        editCount.isEnabled = !busy
+        editDuration.isEnabled = !busy
         btnCancel.visibility = if (busy) View.VISIBLE else View.GONE
         progress.visibility = if (busy) View.VISIBLE else View.GONE
+        if (busy) progress.setProgressCompat(0, false)
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(progressPoller)
         if (isFinishing) {
-            transformer?.cancel()
+            jobId++
+            try { transformer?.cancel() } catch (_: Exception) {}
             tempOutput?.delete()
         }
         super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "KavroClipper"
     }
 }
